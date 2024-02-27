@@ -37,18 +37,13 @@ WantedBy=multi-user.target
 
 EOF
 
-# 重载服务
+# 第七步
 sudo systemctl daemon-reload
-
-# 开机运行 Snell
 sudo systemctl start snell
-
-# 开启 Snell
 sudo systemctl enable snell
-
-sysctl -w net.core.rmem_max=26214400
-
-sysctl -w net.core.rmem_default=26214400
-
+sudo sysctl -w net.core.rmem_max=26214400
+sudo sysctl -w net.core.rmem_default=26214400
 cat /etc/snell-server.conf
+
+
 
