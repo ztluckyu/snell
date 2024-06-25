@@ -43,9 +43,9 @@ EOF
 # Step 5: Start Sing-box
 sudo systemctl start sing-box
 
-# Step 6: Output the configuration template
+# Step 6: Output the configuration template and save to /root/ss2022.txt
 LOCAL_IP=$(hostname -I | awk '{print $1}')
-cat <<EOF
+CONFIG=$(cat <<EOF
 {
   "type": "shadowsocks",
   "tag": "$NAME",
@@ -60,3 +60,10 @@ cat <<EOF
   }
 }
 EOF
+)
+
+echo "$CONFIG" | sudo tee /root/ss2022.txt > /dev/null
+echo "配置模版已存放在 /root/ss2022.txt"
+
+# Also output the configuration to the terminal
+echo "$CONFIG"
