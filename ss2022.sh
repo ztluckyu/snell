@@ -1,10 +1,19 @@
 #!/bin/bash
 
-# Step 1: Check if the system is Debian
-if [ -f /etc/debian_version ]; then
-  echo "This is a Debian-based system."
+# Step 0: Prompt for a name
+read -p "Enter a name: " NAME
+
+# Step 1: Check if the system is Debian or Ubuntu
+if [ -f /etc/debian_version ] || [ -f /etc/lsb-release ]; then
+  . /etc/os-release
+  if [[ "$ID" == "debian" || "$ID" == "ubuntu" ]]; then
+    echo "This is a $ID-based system."
+  else
+    echo "This is not a Debian or Ubuntu-based system. Exiting."
+    exit 1
+  fi
 else
-  echo "This is not a Debian-based system. Exiting."
+  echo "This is not a Debian or Ubuntu-based system. Exiting."
   exit 1
 fi
 
@@ -15,7 +24,7 @@ sudo apt update && sudo apt upgrade -y
 bash <(curl -fsSL https://sing-box.app/deb-install.sh)
 
 # Step 4: Generate a random port and password
-PORT=$((RANDOM % 65535 + 1024))
+PORT=$((RANDOM % 64512 + 1024))
 PASSWORD=$(sing-box generate rand 16 --base64)
 
 # Step 5: Edit the config.json file in /etc/sing-box directory
@@ -53,7 +62,7 @@ LOCAL_IP=$(hostname -I | awk '{print $1}')
 cat <<EOF
 {
   "type": "shadowsocks",
-  "tag": "BWG",
+  "tag": "$NAME",
   "server": "$LOCAL_IP",
   "server_port": $PORT,
   "method": "2022-blake3-aes-128-gcm",
