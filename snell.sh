@@ -5,7 +5,7 @@ sudo apt-get update
 sudo apt-get install -y wget curl sudo vim git lsof mtr iperf3 unzip
 
 # 第二步
-wget https://dl.nssurge.com/snell/snell-server-v4.1.0b1-linux-amd64.zip
+wget https://dl.nssurge.com/snell/snell-server-v4.1.0-linux-amd64.zip
 
 # 第三步
 sudo unzip snell-server-v4.1.0b1-linux-amd64.zip -d /usr/local/bin
