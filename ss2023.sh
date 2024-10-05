@@ -192,22 +192,76 @@ sudo systemctl start sing-box
 
 # Step 7: Output the configuration to /root/ss2022.txt
 LOCAL_IP=$(hostname -I | awk '{print $1}')
-OUTPUT_CONFIG=$(cat <<EOF
+case "$OPTION" in
+  3)
+    OUTPUT_CONFIG=$(cat <<EOF
 {
   "type": "shadowsocks",
-  "tag": "$NAME",
-  "server": "$LOCAL_IP",
-  "server_port": $PORT,
+  "tag": "ss2022+shadowtls",
   "method": "2022-blake3-aes-128-gcm",
+  "listen_port": $SS_PORT,
   "password": "$PASSWORD",
+  "detour": "shadowtls-out",
   "udp_over_tcp": false,
   "multiplex": {
     "enabled": true,
-    "protocol": "h2mux",
     "padding": true
+  }
+},
+{
+  "type": "shadowtls",
+  "tag": "shadowtls-out",
+  "server": "$LOCAL_IP",
+  "server_port": 443,
+  "version": 3,
+  "password": "$UUID",
+  "tls": {
+    "enabled": true,
+    "server_name": "addons.mozilla.org",
+    "utls": {
+      "enabled": true,
+      "fingerprint": "chrome"
+    }
+  }
 }
 EOF
-)
+    )
+    ;;
+  4)
+    OUTPUT_CONFIG=$(cat <<EOF
+{
+  "type": "shadowsocks",
+  "tag": "ss128+shadowtls",
+  "method": "aes-128-gcm",
+  "listen_port": $SS_PORT,
+  "password": "$SS_PASSWORD",
+  "detour": "shadowtls-out",
+  "udp_over_tcp": false,
+  "multiplex": {
+    "enabled": true,
+    "padding": true
+  }
+},
+{
+  "type": "shadowtls",
+  "tag": "shadowtls-out",
+  "server": "$LOCAL_IP",
+  "server_port": 443,
+  "version": 3,
+  "password": "$UUID",
+  "tls": {
+    "enabled": true,
+    "server_name": "addons.mozilla.org",
+    "utls": {
+      "enabled": true,
+      "fingerprint": "chrome"
+    }
+  }
+}
+EOF
+    )
+    ;;
+esac
 
 echo "$OUTPUT_CONFIG" | sudo tee /root/ss2022.txt > /dev/null
 echo "配置模版已存放在 /root/ss2022.txt"
