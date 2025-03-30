@@ -102,18 +102,11 @@ allow-lan: true
 bind-address: '0.0.0.0'
 mode: rule
 log-level: info
-ipv6: false
+ipv6: true
 inbound-tfo: true
 inbound-mptcp: true
-sniffer:
-  enable: true
-  override-destination: true
-  sniff: 
-    QUIC:
-    TLS:
-    HTTP: 
-      ports: [80, 8080-8880]
-      override-destination: true
+
+
 listeners:
   - name: in-ss-mux
     type: shadowsocks
@@ -121,6 +114,19 @@ listeners:
     listen: 0.0.0.0
     password: $SS_PASSWORD
     cipher: 2022-blake3-aes-128-gcm
+    mux-option: { padding: true }
+  - name: in-ss-none
+    type: shadowsocks
+    port: $SS_PORT
+    listen: 0.0.0.0
+    password: $SS_PASSWORD
+    cipher: none
+  - name: in-ss-128
+    type: shadowsocks
+    port: $SS_PORT
+    listen: 0.0.0.0
+    password: $SS_PASSWORD
+    cipher: aes-128-gcm
     mux-option: { padding: true }
   - name: in-anytls
     type: anytls
