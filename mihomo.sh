@@ -74,11 +74,14 @@ sudo mkdir -p /etc/mihomo
 # 创建基本配置文件
 echo "创建基本配置文件..."
 # 生成随机端口和密码
-SS_PORT=$((10000 + RANDOM % 55000))
+SS_PORT_BASE=$((10000 + RANDOM % 55000))
+SS_PORT_MUX=$((SS_PORT_BASE + 1))
+SS_PORT_NONE=$((SS_PORT_BASE + 2))
+SS_PORT_128=$((SS_PORT_BASE + 3))
 ANYTLS_PORT=$((10000 + RANDOM % 55000))
 
-# 确保两个端口不同
-while [ "$SS_PORT" -eq "$ANYTLS_PORT" ]; do
+# 确保AnyTLS端口与SS端口不冲突
+while [ "$ANYTLS_PORT" -ge "$SS_PORT_BASE" ] && [ "$ANYTLS_PORT" -le "$((SS_PORT_BASE + 3))" ]; do
   ANYTLS_PORT=$((10000 + RANDOM % 55000))
 done
 
@@ -110,20 +113,20 @@ inbound-mptcp: true
 listeners:
   - name: in-ss-mux
     type: shadowsocks
-    port: $SS_PORT+1
+    port: $SS_PORT_MUX
     listen: 0.0.0.0
     password: $SS_PASSWORD
     cipher: 2022-blake3-aes-128-gcm
     mux-option: { padding: true }
   - name: in-ss-none
     type: shadowsocks
-    port: $SS_PORT+2
+    port: $SS_PORT_NONE
     listen: 0.0.0.0
     password: $SS_PASSWORD
     cipher: none
   - name: in-ss-128
     type: shadowsocks
-    port: $SS_PORT+3
+    port: $SS_PORT_128
     listen: 0.0.0.0
     password: $SS_PASSWORD
     cipher: aes-128-gcm
@@ -177,9 +180,10 @@ echo "证书文件位置：/etc/mihomo/ca.cer"
 echo "密钥文件位置：/etc/mihomo/ca.key"
 echo ""
 echo "Shadowsocks 配置信息："
-echo "  端口: $SS_PORT"
+echo "  端口1 (mux): $SS_PORT_MUX  - 加密方式: 2022-blake3-aes-128-gcm"
+echo "  端口2 (none): $SS_PORT_NONE  - 加密方式: none"
+echo "  端口3 (128): $SS_PORT_128  - 加密方式: aes-128-gcm"
 echo "  密码: $SS_PASSWORD"
-echo "  加密方式: 2022-blake3-aes-128-gcm"
 echo ""
 echo "AnyTLS 配置信息："
 echo "  端口: $ANYTLS_PORT"
