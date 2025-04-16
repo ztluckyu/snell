@@ -110,20 +110,20 @@ inbound-mptcp: true
 listeners:
   - name: in-ss-mux
     type: shadowsocks
-    port: $SS_PORT
+    port: $SS_PORT+1
     listen: 0.0.0.0
     password: $SS_PASSWORD
     cipher: 2022-blake3-aes-128-gcm
     mux-option: { padding: true }
   - name: in-ss-none
     type: shadowsocks
-    port: $SS_PORT
+    port: $SS_PORT+2
     listen: 0.0.0.0
     password: $SS_PASSWORD
     cipher: none
   - name: in-ss-128
     type: shadowsocks
-    port: $SS_PORT
+    port: $SS_PORT+3
     listen: 0.0.0.0
     password: $SS_PASSWORD
     cipher: aes-128-gcm
