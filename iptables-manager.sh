@@ -121,6 +121,32 @@ list_tc_rules() {
             tc -s qdisc show dev $iface
             tc -s class show dev $iface
             tc -s filter show dev $iface
+            
+            # 解析并显示每个 IP 的限速配置
+            echo -e "${BLUE}当前限速配置:${NC}"
+            tc filter show dev $iface | grep -A4 "fh.*:" | while read -r line; do
+                if [[ $line == *"match"* ]]; then
+                    # 提取 IP 地址和 flowid
+                    ip_hex=$(echo $line | awk '{print $2}' | cut -d'/' -f1)
+                    flowid=$(echo "$line" | grep -oE "flowid [0-9:]+")
+                    
+                    if [ -n "$flowid" ]; then
+                        # 从上一行或当前行中提取 flowid
+                        if [[ $flowid != *"flowid"* ]]; then
+                            flowid=$(tc filter show dev $iface | grep -B2 "$ip_hex" | grep "flowid" | awk '{print $6}')
+                        else
+                            flowid=$(echo $flowid | awk '{print $2}')
+                        fi
+                        
+                        # 查找对应的 class 并获取限速信息
+                        rate_info=$(tc class show dev $iface | grep "classid $flowid" | awk '{print $6}')
+                        
+                        # 正确的字节顺序转换（大端字节序）
+                        ip_addr=$(printf "%d.%d.%d.%d" 0x${ip_hex:0:2} 0x${ip_hex:2:2} 0x${ip_hex:4:2} 0x${ip_hex:6:2})
+                        echo -e "  IP: $ip_addr → 限速: $rate_info"
+                    fi
+                fi
+            done
             found_rules=1
         fi
     done
@@ -130,6 +156,230 @@ list_tc_rules() {
     fi
     
     echo "-------------------------------------------------------------------------"
+}
+
+# 初始化 HTB 系统（如果尚未初始化）
+init_htb_system() {
+    local main_interface=$(ip -o -4 route show to default | awk '{print $5}' | head -n1)
+    
+    if [ -z "$main_interface" ]; then
+        echo -e "${RED}错误: 无法确定主网络接口${NC}"
+        return 1
+    fi
+    
+    # 检查是否已经初始化了 HTB 系统
+    tc_rules=$(tc qdisc show dev $main_interface 2>/dev/null)
+    if [[ "$tc_rules" != *htb* ]]; then
+        echo -e "${YELLOW}正在初始化 HTB 流量控制系统...${NC}"
+        
+        # 清除可能存在的旧规则
+        tc qdisc del dev $main_interface root 2>/dev/null
+        
+        # 创建 HTB qdisc
+        tc qdisc add dev $main_interface root handle 1: htb default 999
+        
+        # 创建主类（设置一个大一点的带宽，支持多个子类）
+        tc class add dev $main_interface parent 1: classid 1:1 htb rate 1000mbit ceil 1000mbit
+        
+        # 创建默认类（用于未被限速的流量）
+        tc class add dev $main_interface parent 1:1 classid 1:999 htb rate 1000mbit ceil 1000mbit
+        
+        echo -e "${GREEN}HTB 流量控制系统初始化完成${NC}"
+    fi
+    
+    echo $main_interface
+}
+
+# 为目标 IP 添加限速规则
+add_rate_limit() {
+    local target_ip=$1
+    local limit_rate=$2
+    
+    # 检查参数
+    if [ -z "$target_ip" ] || [ -z "$limit_rate" ]; then
+        echo -e "${RED}错误: 目标 IP 和限速值不能为空.${NC}"
+        return 1
+    fi
+    
+    # 设置突发流量限制为基本速率的 1.125 倍
+    local burst_rate=$(echo "$limit_rate * 1.125" | bc | cut -d'.' -f1)
+    
+    # 初始化 HTB 系统并获取主网络接口
+    local main_interface=$(init_htb_system)
+    if [ $? -ne 0 ]; then
+        return 1
+    fi
+    
+    echo -e "${BLUE}为目标 IP: $target_ip 添加限速规则${NC}"
+    echo -e "${YELLOW}限速: $limit_rate Mbps (突发: $burst_rate Mbps)${NC}"
+    echo -e "${YELLOW}网络接口: $main_interface${NC}"
+    
+    # 找到下一个可用的 class ID（从 10 开始递增）
+    local next_class_id=$(tc class show dev $main_interface | grep -oE "classid 1:[0-9]+" | cut -d':' -f2 | sort -n | tail -n1)
+    if [ -z "$next_class_id" ] || [ "$next_class_id" -lt "10" ]; then
+        next_class_id=10
+    else
+        next_class_id=$((next_class_id + 1))
+    fi
+    
+    # 将 IP 转换为十六进制格式
+    IFS='.' read -ra ADDR <<< "$target_ip"
+    # 修正：使用大端字节序（网络字节序）
+    target_ip_hex=$(printf "%02x%02x%02x%02x" "${ADDR[0]}" "${ADDR[1]}" "${ADDR[2]}" "${ADDR[3]}")
+    
+    if echo "$ip_filter" | grep -q "$target_ip_hex"; then
+        echo -e "${YELLOW}警告: IP $target_ip 已存在限速规则，是否要覆盖？(y/n)${NC}"
+        read -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo "操作已取消."
+            return 0
+        fi
+        
+        # 删除现有规则（需要找到对应的 filter 和 class）
+        local existing_filter=$(tc filter show dev $main_interface | grep -B3 "$target_ip_hex" | head -1 | awk '{print $5}' | cut -d':' -f2)
+        if [ -n "$existing_filter" ]; then
+            tc filter del dev $main_interface parent 1: pref 1 handle "$existing_filter"
+            tc class del dev $main_interface classid "1:$existing_filter"
+            echo -e "${YELLOW}已删除现有的限速规则${NC}"
+        fi
+    fi
+    
+    # 创建新的子类
+    tc class add dev $main_interface parent 1:1 classid "1:$next_class_id" htb rate "${limit_rate}mbit" ceil "${burst_rate}mbit"
+    
+    # 添加过滤器
+    tc filter add dev $main_interface parent 1: protocol ip prio 1 u32 match ip dst "$target_ip" flowid "1:$next_class_id"
+    
+    echo -e "${GREEN}限速规则添加成功！${NC}"
+    echo -e "${BLUE}新规则详情：${NC}"
+    echo -e "  目标 IP: $target_ip"
+    echo -e "  限速: $limit_rate Mbps"
+    echo -e "  突发: $burst_rate Mbps"
+    echo -e "  Class ID: 1:$next_class_id"
+    
+    return 0
+}
+
+# 删除特定 IP 的限速规则
+delete_single_rate_limit() {
+    echo -e "${BLUE}删除特定 IP 的限速规则${NC}"
+    
+    # 列出当前限速规则
+    list_tc_rules
+    
+    # 查找主网络接口
+    local main_interface=$(ip -o -4 route show to default | awk '{print $5}' | head -n1)
+    
+    if [ -z "$main_interface" ]; then
+        echo -e "${RED}错误: 无法确定主网络接口${NC}"
+        return 1
+    fi
+    
+    # 显示所有现有的限速 IP 列表
+    echo -e "${BLUE}当前限速的 IP 地址列表:${NC}"
+    tc filter show dev $main_interface | grep -E "fh.* (flowid|match)" | while read -r line; do
+        if [[ $line == *"match"* ]]; then
+            # 提取 IP 地址
+            ip_hex=$(echo $line | awk '{print $2}' | cut -d'/' -f1)
+            # 修正：使用大端字节序解析
+            ip_addr=$(printf "%d.%d.%d.%d" 0x${ip_hex:0:2} 0x${ip_hex:2:2} 0x${ip_hex:4:2} 0x${ip_hex:6:2})
+            echo -e "  - $ip_addr"
+        fi
+    done
+    echo ""
+    
+    # 获取要删除的 IP
+    read -p "输入要删除限速的 IP 地址: " target_ip
+    
+    # 检查输入的 IP 格式
+    if [[ ! $target_ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        echo -e "${RED}错误: 无效的 IP 地址格式${NC}"
+        return 1
+    fi
+    
+    # 将 IP 转换为十六进制格式（使用正确的字节顺序）
+    IFS='.' read -ra ADDR <<< "$target_ip"
+    # 修正：使用大端字节序（网络字节序）
+    local target_ip_hex=$(printf "%02x%02x%02x%02x" "${ADDR[0]}" "${ADDR[1]}" "${ADDR[2]}" "${ADDR[3]}")
+    
+    # 调试信息
+    echo -e "${YELLOW}查找 IP 的十六进制: $target_ip_hex${NC}"
+    
+    # 解析 filter 信息
+    local filter_full_output=$(tc filter show dev $main_interface)
+    local found_filter=false
+    local filter_line=""
+    local filter_handle=""
+    local filter_flowid=""
+    
+    # 逐行处理 filter 输出
+    while IFS= read -r line; do
+        if [[ $line == *"fh 800::"* ]] && [[ $line == *"flowid"* ]]; then
+            # 这是包含 handle 和 flowid 的行
+            filter_line="$line"
+        elif [[ $line == *"match"* ]] && [[ $line == *"$target_ip_hex"* ]]; then
+            # 找到匹配的 IP
+            if [ -n "$filter_line" ]; then
+                # 提取 handle
+                filter_handle=$(echo "$filter_line" | grep -oE "fh [0-9]+::[0-9]+" | awk '{print $2}')
+                # 提取 flowid
+                filter_flowid=$(echo "$filter_line" | grep -oE "flowid [0-9:]*" | awk '{print $2}')
+                found_filter=true
+                break
+            fi
+        fi
+    done <<< "$filter_full_output"
+    
+    if [ "$found_filter" = false ] || [ -z "$filter_handle" ] || [ -z "$filter_flowid" ]; then
+        echo -e "${RED}错误: 未找到 IP $target_ip 的限速规则${NC}"
+        return 1
+    fi
+    
+    echo -e "${YELLOW}准备删除:${NC}"
+    echo -e "  Filter handle: $filter_handle"
+    echo -e "  Flowid: $filter_flowid"
+    
+    # 删除 filter（需要使用完整的 handle）
+    tc filter del dev $main_interface parent 1: protocol ip pref 1 handle "$filter_handle" u32
+    
+    # 删除 class（先检查是否还有其他 filter 使用这个 class）
+    local remaining_filters=$(tc filter show dev $main_interface | grep -c "$filter_flowid")
+    if [ "$remaining_filters" -eq 0 ]; then
+        tc class del dev $main_interface classid "$filter_flowid"
+        echo -e "${GREEN}已成功删除 IP $target_ip 的限速规则和相关 class${NC}"
+    else
+        echo -e "${GREEN}已成功删除 IP $target_ip 的限速规则${NC}"
+        echo -e "${YELLOW}注意: class $filter_flowid 还有其他 filter 使用，未删除${NC}"
+    fi
+}
+
+# 管理多个 IP 的限速规则
+manage_multiple_rate_limits() {
+    echo -e "${BLUE}管理多个 IP 的限速规则${NC}"
+    echo "当前选项:"
+    echo "1) 查看所有限速规则"
+    echo "2) 添加新的 IP 限速规则"
+    echo "3) 删除特定 IP 的限速规则"
+    echo "4) 返回主菜单"
+    echo ""
+    read -p "请选择 (1-4): " choice
+    
+    case $choice in
+        1) list_tc_rules ;;
+        2) 
+            read -p "输入目标 IP 地址: " target_ip
+            read -p "设置限速值 (Mbps): " rate_limit
+            if [ -n "$target_ip" ] && [ -n "$rate_limit" ] && [ "$rate_limit" -eq "$rate_limit" ] 2>/dev/null; then
+                add_rate_limit "$target_ip" "$rate_limit"
+            else
+                echo -e "${RED}无效的输入.${NC}"
+            fi
+            ;;
+        3) delete_single_rate_limit ;;
+        4) return ;;
+        *) echo -e "${RED}无效的选择.${NC}" ;;
+    esac
 }
 
 # 添加新的端口转发规则
@@ -208,51 +458,6 @@ add_rule() {
     fi
 }
 
-# 为目标 IP 添加限速规则
-add_rate_limit() {
-    local target_ip=$1
-    local limit_rate=$2
-    
-    # 检查参数
-    if [ -z "$target_ip" ] || [ -z "$limit_rate" ]; then
-        echo -e "${RED}错误: 目标 IP 和限速值不能为空.${NC}"
-        return 1
-    fi
-    
-    # 设置突发流量限制为基本速率的 1.125 倍
-    local burst_rate=$(echo "$limit_rate * 1.125" | bc | cut -d'.' -f1)
-    
-    # 查找主网络接口（假设是有公网 IP 的接口）
-    local main_interface=$(ip -o -4 route show to default | awk '{print $5}' | head -n1)
-    
-    if [ -z "$main_interface" ]; then
-        echo -e "${RED}错误: 无法确定主网络接口${NC}"
-        return 1
-    fi
-    
-    echo -e "${BLUE}为目标 IP: $target_ip 添加限速规则${NC}"
-    echo -e "${YELLOW}限速: $limit_rate Mbps (突发: $burst_rate Mbps)${NC}"
-    echo -e "${YELLOW}网络接口: $main_interface${NC}"
-    
-    # 清除可能存在的旧 tc 规则
-    echo -e "${YELLOW}清除现有 tc 规则...${NC}"
-    tc qdisc del dev $main_interface root 2>/dev/null
-    
-    # 配置 tc 进行流量限制
-    echo -e "${YELLOW}配置流量限制...${NC}"
-    # 创建 HTB qdisc
-    tc qdisc add dev $main_interface root handle 1: htb default 10
-    # 创建主类
-    tc class add dev $main_interface parent 1: classid 1:1 htb rate $((limit_rate + 100))mbit ceil $((limit_rate + 100))mbit
-    # 创建子类，用于限制到目标 IP 的流量
-    tc class add dev $main_interface parent 1:1 classid 1:10 htb rate ${limit_rate}mbit ceil ${burst_rate}mbit
-    # 添加过滤器匹配目标 IP
-    tc filter add dev $main_interface parent 1: protocol ip prio 1 u32 match ip dst $target_ip flowid 1:10
-    
-    echo -e "${GREEN}限速规则添加成功!${NC}"
-    return 0
-}
-
 # 删除端口转发规则
 delete_rule() {
     echo -e "${BLUE}删除端口转发规则${NC}"
@@ -293,62 +498,6 @@ delete_rule() {
     read -p "是否保存当前规则? (y/n): " save_rules
     if [ "$save_rules" = "y" ] || [ "$save_rules" = "Y" ]; then
         save_iptables_rules
-    fi
-}
-
-# 删除限速规则
-delete_rate_limit() {
-    echo -e "${BLUE}删除限速规则${NC}"
-    
-    # 列出当前限速规则
-    list_tc_rules
-    
-    # 查找主网络接口（假设是有公网 IP 的接口）
-    local main_interface=$(ip -o -4 route show to default | awk '{print $5}' | head -n1)
-    
-    if [ -z "$main_interface" ]; then
-        echo -e "${RED}错误: 无法确定主网络接口${NC}"
-        return 1
-    fi
-    
-    read -p "确认要删除所有限速规则吗? (y/n): " confirm
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        # 清除 tc 规则
-        tc qdisc del dev $main_interface root 2>/dev/null
-        echo -e "${GREEN}所有限速规则已删除.${NC}"
-    else
-        echo "操作已取消."
-    fi
-}
-
-# 为现有转发添加限速
-rate_limit_existing() {
-    echo -e "${BLUE}为现有转发添加限速${NC}"
-    
-    # 列出当前规则
-    list_rules
-    
-    # 获取目标 IP
-    read -p "输入要限速的目标 IP 地址: " target_ip
-    
-    # 检查该 IP 是否存在于转发规则中
-    existing_rule=$(sudo iptables -t nat -L PREROUTING -n | grep $target_ip | wc -l)
-    
-    if [ "$existing_rule" -eq "0" ]; then
-        echo -e "${RED}错误: 未找到目标 IP 为 $target_ip 的转发规则.${NC}"
-        read -p "是否要为此 IP 添加新的转发规则? (y/n): " add_new
-        if [ "$add_new" = "y" ] || [ "$add_new" = "Y" ]; then
-            add_rule
-        fi
-        return
-    fi
-    
-    # 获取限速值
-    read -p "设置限速值 (Mbps): " rate_limit
-    if [ -n "$rate_limit" ] && [ "$rate_limit" -eq "$rate_limit" ] 2>/dev/null; then
-        add_rate_limit "$target_ip" "$rate_limit"
-    else
-        echo -e "${RED}无效的限速值.${NC}"
     fi
 }
 
@@ -434,13 +583,11 @@ main_menu() {
     echo "4) 保存 iptables 规则"
     echo "5) 清除所有 NAT 规则"
     echo "6) 检查/启用 IP 转发"
-    echo "7) 为现有转发添加限速"
-    echo "8) 查看当前限速规则"
-    echo "9) 删除限速规则"
+    echo "7) 管理多个 IP 的限速规则"
     echo "h) 帮助信息"
     echo "0) 退出"
     echo ""
-    read -p "请选择 (0-9, h): " choice
+    read -p "请选择 (0-7, h): " choice
     
     case $choice in
         1) list_rules; press_enter_to_continue ;;
@@ -449,86 +596,11 @@ main_menu() {
         4) save_iptables_rules; press_enter_to_continue ;;
         5) clear_rules; press_enter_to_continue ;;
         6) enable_ip_forwarding; press_enter_to_continue ;;
-        7) rate_limit_existing; press_enter_to_continue ;;
-        8) list_tc_rules; press_enter_to_continue ;;
-        9) delete_rate_limit; press_enter_to_continue ;;
+        7) manage_multiple_rate_limits; press_enter_to_continue ;;
         h) show_help; press_enter_to_continue ;;
         0) exit 0 ;;
         *) echo -e "${RED}无效的选择.${NC}"; press_enter_to_continue ;;
     esac
-}
-
-# 添加新的限速并转发功能
-add_port_forward_with_rate_limit() {
-    echo -e "${BLUE}添加新的端口转发并设置限速${NC}"
-    
-    # 确保 IP 转发已启用
-    enable_ip_forwarding
-    
-    # 获取用户输入
-    read -p "本地端口号: " local_port
-    read -p "目标 IP 地址: " target_ip
-    read -p "目标端口号 (默认与本地端口相同): " target_port
-    read -p "设置限速值 (Mbps): " rate_limit
-    
-    # 验证输入
-    if [ -z "$local_port" ] || [ -z "$target_ip" ] || [ -z "$rate_limit" ]; then
-        echo -e "${RED}错误: 本地端口、目标 IP 和限速值不能为空.${NC}"
-        return 1
-    fi
-    
-    # 如果目标端口为空，则使用本地端口
-    if [ -z "$target_port" ]; then
-        target_port=$local_port
-    fi
-    
-    # 询问协议类型
-    echo "选择协议类型:"
-    echo "1) TCP"
-    echo "2) UDP"
-    echo "3) 两者都添加"
-    read -p "请选择 (1-3): " protocol_choice
-    
-    # 根据选择添加规则
-    case $protocol_choice in
-        1)
-            sudo iptables -t nat -A PREROUTING -p tcp --dport $local_port -j DNAT --to-destination $target_ip:$target_port
-            echo -e "${GREEN}已添加 TCP 端口 $local_port 转发到 $target_ip:$target_port${NC}"
-            ;;
-        2)
-            sudo iptables -t nat -A PREROUTING -p udp --dport $local_port -j DNAT --to-destination $target_ip:$target_port
-            echo -e "${GREEN}已添加 UDP 端口 $local_port 转发到 $target_ip:$target_port${NC}"
-            ;;
-        3)
-            sudo iptables -t nat -A PREROUTING -p tcp --dport $local_port -j DNAT --to-destination $target_ip:$target_port
-            sudo iptables -t nat -A PREROUTING -p udp --dport $local_port -j DNAT --to-destination $target_ip:$target_port
-            echo -e "${GREEN}已添加 TCP 和 UDP 端口 $local_port 转发到 $target_ip:$target_port${NC}"
-            ;;
-        *)
-            echo -e "${RED}无效的选择，未添加任何规则.${NC}"
-            return 1
-            ;;
-    esac
-    
-    # 添加 MASQUERADE 规则
-    existing_masq=$(sudo iptables -t nat -L POSTROUTING -n | grep $target_ip | grep MASQUERADE | wc -l)
-    if [ $existing_masq -eq 0 ]; then
-        sudo iptables -t nat -A POSTROUTING -d $target_ip -j MASQUERADE
-        echo -e "${GREEN}已添加 MASQUERADE 规则用于 $target_ip${NC}"
-    else
-        echo -e "${YELLOW}MASQUERADE 规则已存在，跳过添加.${NC}"
-    fi
-    
-    # 添加限速规则
-    add_rate_limit "$target_ip" "$rate_limit"
-    
-    # 询问是否保存规则
-    read -p "是否保存当前规则? (y/n): " save_rules
-    if [ "$save_rules" = "y" ] || [ "$save_rules" = "Y" ]; then
-        save_iptables_rules
-    fi
-    
-    return 0
 }
 
 # 主程序
@@ -553,7 +625,7 @@ if [ $# -gt 0 ]; then
         -s|--save) save_iptables_rules ;;
         -c|--clear) clear_rules ;;
         -f|--forward) enable_ip_forwarding ;;
-        -r|--rate) rate_limit_existing ;;
+        -r|--rate) manage_multiple_rate_limits ;;
         -i|--info) list_tc_rules ;;
         *) echo -e "${RED}未知参数: $1${NC}"; show_help ;;
     esac
